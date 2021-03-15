@@ -1,0 +1,430 @@
+#!/usr/bin/env python3
+"""squishimi - draw sashimi plots
+
+Usage:
+    squishimi [options] <locus> <input>...
+
+Arguments:
+    <locus>     The locus for the plot. This may be one of two forms: chrom:start-end, or @gene-name.
+                In the chromosome-range form, the positions are 1-based, and inclusive. If the
+                @gene-name form is used, an annotation file (see -a) must be given.
+    <input>     The input files must either be BAM files, or the name starts with `@`, the remainder
+                is taken as a filename for a tab-separated file with two columns. The first column
+                is the sample name, and the second is the path-name for the corresponding BAM file.
+                If BAM files are given directly, sample names may be given as a comma separated list
+                with the -s option.
+
+Options:
+    -a FILE, --annotation FILE          filename for GTF annotation (required for a transcript track or gene-name locus)
+    -o FILE, --output FILE              filename to write the plot to. If not supplied, only the intermediate tables
+                                        will be produced.
+    -s NAMES, --sample-names NAMES      comma separated list of sample names.
+    -t PREFIX, --table-prefix PREFIX    path prefix for intermediate tables [default: ./squishimi-]
+"""
+import json
+import os
+import random
+import re
+import subprocess
+import pysam
+from docopt import docopt
+from gtfparse import read_gtf
+from intervaltree import IntervalTree, Interval
+
+class annotation(object):
+    def __init__(self, annotationFile):
+        self.annotationFile = annotationFile
+        self.annotation = None
+
+    def __call__(self):
+        if self.annotation is None:
+            self.annotation = read_gtf(self.annotationFile)
+        return self.annotation
+
+class locus(object):
+    def __init__(self, locStr, lazyAnnot):
+        if locStr.startswith('@'):
+            if lazyAnnot.annotationFile is None:
+                Exception(f"gene-name locus requires an annotation file.")
+            annot = lazyAnnot()
+            geneName = locStr[1:]
+            genes = annot[(annot["feature"] == "gene") & (annot["gene_name"] == geneName)]
+            if len(genes) == 0:
+                # If gene_name failed, let's try the Ensembl Gene ID.
+                genes = annot[(annot["feature"] == "gene") & (annot["gene_id"] == geneName)]
+            if len(genes) == 0:
+                Exception(f"unable to locate `{geneName}` in annotation.")
+            if len(genes) > 1:
+                Exception(f"the annotation file contains {len(genes)} matches for `{geneName}`.")
+            self.chrom = genes.iloc(0)[0][0]
+            self.start = genes.iloc(0)[0][1]
+            self.stop = genes.iloc(0)[0][2]
+            self.begin = start - 1
+            self.end = stop
+            return
+        loc = locus.parse(locStr)
+        if loc is not None:
+            (chrom, start, stop) = loc
+            self.chrom = chrom
+            self.start = start
+            self.stop = stop
+            self.begin = start - 1
+            self.end = stop
+            return
+        raise Exception(f"unable to parse locus string: `{locStr}`")
+
+    @staticmethod
+    def parse(txt):
+        m = re.match('^([^:]+):([0-9]+)-([0-9]+)$', txt)
+        if m is None:
+            return None
+        grps = m.groups()
+        return (grps[0], int(grps[1]), int(grps[2]))
+
+def marshal_bams(names, sampleNames):
+    if sampleNames is None:
+        sampleNames = []
+    else:
+        sampleNames = sampleNames.split(",")
+
+    res = []
+    for origName in names:
+        if origName.startswith("@"):
+            with open(origName[1:]) as f:
+                for l in f:
+                    t = l.split()
+                    samName = t[0]
+                    bamName = t[1]
+                    res.append((samName, bamName))
+        else:
+            bamName = origName
+            if len(sampleNames):
+                samName = sampleNames[0]
+                del sampleNames[0]
+            else:
+                samName = origName
+            res.append((samName, bamName))
+    return res
+
+def scan_bam_file(loc, bamName):
+    sam = pysam.AlignmentFile(bamName)
+    try:
+        cov = [0 for pos in range(loc.begin, loc.end)]
+        junk = {}
+
+        for rd in sam.fetch(loc.chrom, loc.begin, loc.end):
+            flgs = rd.flag
+            rd_pos = rd.reference_start # zero-based
+            cig = rd.cigarstring
+
+            if any(map(lambda x: x in cig, ['H', 'P', 'X', '='])):
+                continue
+
+            ops = re.split("[0-9]+", cig)[1:]
+            lens = list(map(int, re.split("[MIDNS]", cig)[:-1]))
+
+            pos = rd_pos
+            for (i, (op, n)) in enumerate(zip(ops, lens)):
+                if op == 'M':
+                    for j in range(max(loc.begin, pos), min(loc.end, pos+n)):
+                        cov[j-loc.begin] += 1
+                if op == 'I' or op == 'S':
+                    continue
+                if op == 'D':
+                    pass
+                if op == 'N':
+                    donor = pos
+                    acceptor = pos + n
+                    if loc.begin <= donor and acceptor < loc.end:
+                        k = (donor, acceptor)
+                        if k not in junk:
+                            junk[k] = 0
+                        junk[k] += 1
+                pos += n
+
+        return (cov, junk)
+    finally:
+        sam.close()
+
+class unionfind(object):
+    """
+    This class implements the disjoint-set/union-find data structure.
+
+    Unlike some implementations, it does not need initialization with
+    the full domain of labels in advance. The labels may be any type
+    that can be used as a key to a standard Python dictionary.
+
+    For general information on this data structure see
+    https://en.wikipedia.org/wiki/Disjoint-set_data_structure
+    """
+    def __init__(self):
+        """
+        Create a new disjoint-set data structure.
+        """
+        self.parent = {}
+        self.rank = {}
+
+    def find(self, x):
+        """
+        Return the label of the partition to which `x` belongs.
+
+        If `x` has not previously been added as a label to the
+        disjoint-set, it is added and becomes a singleton partition.
+        """
+        if x not in self.parent:
+            self.parent[x] = x
+            self.rank[x] = 0
+            return x
+        xp = self.parent[x]
+        if xp != x:
+            self.parent[x] = self.find(xp)
+        return self.parent[x]
+
+    def union(self, x, y):
+        """
+        Merge two partitions in the disjoint-set data structure.
+        The two partitions are which ever partition `x` and `y` belong
+        to, respectively.
+
+        If `x` and `y` are already in the same partition, this operation
+        has no effect.
+        """
+        xr = self.find(x)
+        yr = self.find(y)
+
+        if xr == yr:
+            return
+
+        if self.rank[xr] < self.rank[yr]:
+            self.parent[xr] = yr
+        elif self.rank[xr] > self.rank[yr]:
+            self.parent[yr] = xr
+        else:
+            self.parent[yr] = xr
+            self.rank[xr] += 1
+
+class digraph(object):
+    def __init__(self):
+        self.V = set([])
+        self.fwd = {}
+        self.rev = {}
+
+    def __getitem__(self, x):
+        if x in self.fwd:
+            return self.fwd[x]
+        return set([])
+
+    def __setitem__(self, x, y):
+        if x not in self.fwd:
+            self.fwd[x] = set([])
+        self.fwd[x].add(y)
+        if y not in self.rev:
+            self.rev[y] = set([])
+        self.rev[y].add(x)
+
+
+class tarjan(object):
+    def __init__(self, G):
+        self.G = G
+
+    def sccs(self):
+        self.idx = 0
+        self.I = {}
+        self.L = {}
+        self.S = []
+        self.O = set([])
+
+        V = set(self.G.fwd.keys()) | set(self.G.rev.keys())
+        for v in sorted(V):
+            if v not in self.I:
+                for r in self.scc(v):
+                    yield r
+
+    def scc(self, v):
+        self.I[v] = self.idx
+        self.L[v] = self.idx
+        self.idx += 1
+        self.S.append(v)
+        self.O.add(v)
+
+        for w in sorted(self.G[v]):
+            if w not in self.I:
+                for r in self.scc(w):
+                    yield r
+                self.L[v] = min(self.L[v], self.L[w])
+            elif w in self.O:
+                self.L[v] = min(self.L[v], self.I[w])
+
+        if self.L[v] == self.I[v]:
+            t = []
+            while True:
+                w = self.S.pop()
+                self.O.remove(w)
+                t.append(w)
+                if w == v:
+                    break
+            yield sorted(t)
+
+class undigraph(object):
+    def __init__(self):
+        self.edge = {}
+
+    def __getitem__(self, x):
+        if x in self.edge:
+            return self.edge[x]
+        return set([])
+
+    def __setitem__(self, x, y):
+        if x not in self.edge:
+            self.edge[x] = set([])
+        self.edge[x].add(y)
+        if y not in self.edge:
+            self.edge[y] = set([])
+        self.edge[y].add(x)
+
+def layout(itms):
+    over = IntervalTree()
+    under = IntervalTree()
+
+    perm = list(range(len(itms)))
+    random.shuffle(perm)
+    for i in perm:
+        (k, n) = itms[i]
+        oOlp = over.overlap(k[0], k[1])
+        oEnv = over.envelop(k[0], k[1])
+        oInt = oOlp - oEnv
+        uOlp = under.overlap(k[0], k[1])
+        uEnv = under.envelop(k[0], k[1])
+        uInt = uOlp - uEnv
+
+        if len(oOlp) == 0:
+            over[k[0]:k[1]] = n
+        elif len(uOlp) == 0:
+            under[k[0]:k[1]] = n
+        elif len(oInt) <= len(uInt):
+            over[k[0]:k[1]] = n
+        else:
+            under[k[0]:k[1]] = n
+
+    return (over, under)
+
+def score(ivls):
+    d = 0
+    for x in ivls:
+        o = ivls.overlap(x)
+        o.remove(x)
+        e = ivls.envelop(x)
+        e.remove(x)
+        d += len(o - e)
+    return d
+
+def parts(ivls):
+    uf = unionfind()
+    for x in ivls:
+        xk = (x[0], x[1])
+        o = ivls.overlap(x)
+        o.remove(x)
+        for y in sorted(o):
+            yk = (y[0], y[1])
+            uf.union(xk, yk)
+    r = {}
+    for x in ivls:
+        xk = (x[0], x[1])
+        yk = uf.find(xk)
+        if yk not in r:
+            r[yk] = []
+        r[yk].append(xk)
+    return sorted([sorted(xs) for xs in r.values()])
+
+def mkEnvGraph(xs, ivls):
+    g = digraph()
+    for x in xs:
+        e = ivls.envelop(x[0], x[1])
+        for yi in sorted(e):
+            y = (yi[0], yi[1])
+            if y != x:
+                g[x] = y
+    return g
+
+def mkIntGraph(xs, ivls):
+    g0 = mkEnvGraph(xs, ivls)
+    g = digraph()
+    for x in xs:
+        e = ivls.envelop(x[0], x[1])
+        for yi in sorted(e):
+            y = (yi[0], yi[1])
+            if y != x:
+                g[x] = y
+        o = ivls.overlap(x[0], x[1])
+        for yi in sorted(o - e):
+            y = (yi[0], yi[1])
+            if x in g0[y]:
+                continue
+            g[x] = y
+            g[y] = x
+    return g
+
+def main(args):
+    #print(args)
+    lazyAnnot = annotation(args['--annotation'])
+    loc = locus(args['<locus>'], lazyAnnot)
+    inputs = marshal_bams(args['<input>'], args['--sample-names'])
+
+    tables = []
+    for (sampleName, bamName) in inputs:
+        (cov, junk) = scan_bam_file(loc, bamName)
+        tables.append((sampleName, cov, junk))
+
+    covName = args['--table-prefix'] + "coverage.txt"
+    junkName = args['--table-prefix'] + "junctions.txt"
+    txsName = args['--table-prefix'] + "transcripts.txt"
+
+    with open(covName, 'wt') as out:
+        print("sample\tpos\tcov", file=out)
+        for (sn, cov, junk) in tables:
+            for i, c in enumerate(cov):
+                print(f"{sn}\t{loc.start+i}\t{c}", file=out)
+
+    with open(junkName, 'wt') as out:
+        print("sample\tstart\tstop\tcov\tlev", file=out)
+        for (sn, cov, junk) in tables:
+            allItems = sorted(junk.items())
+
+            ivls = IntervalTree()
+            for (k, n) in allItems:
+                ivls[k[0]:k[1]] = n
+
+            for xs in parts(ivls):
+                gph = mkIntGraph(xs, ivls)
+                t = tarjan(gph)
+                cs = list(t.sccs())
+                i = 0
+                for c in cs:
+                    for k in c:
+                        j = [1, -1][i &1]*(1 + (i >> 1))
+                        i += 1
+                        print(f"{sn}\t{k[0]+1}\t{k[1]}\t{junk[k]}\t{j}", file=out)
+
+    if args['--annotation']:
+        annot = lazyAnnot()
+        txs = set(annot[(annot["seqname"] == loc.chrom) & (annot["start"] >= loc.start) & (annot["end"] <= loc.stop) & (annot["feature"] == "transcript")]["transcript_id"].tolist())
+        txTbl = annot[annot["transcript_id"].isin(txs)]
+        txTbl[["seqname", "start", "end", "feature", "transcript_id"]].to_csv(txsName, sep='\t', header=True, index=False)
+
+    if args['--output']:
+        rCmd = "squishimi-r"
+        if os.environ.get("SQUISHIMI_R"):
+            rCmd = os.environ.get("SQUISHIMI_R")
+        cmd = [rCmd]
+        if args["--annotation"]:
+            cmd += ["--transcripts", txsName]
+        cmd += [covName]
+        cmd += [junkName]
+        cmd += [args['--output']]
+        #print(' '.join(cmd))
+        subprocess.run(cmd)
+
+if __name__ == '__main__':
+    arguments = docopt(__doc__)
+    main(arguments)
+# vim: set ft=python:

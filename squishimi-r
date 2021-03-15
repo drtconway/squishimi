@@ -1,0 +1,109 @@
+#!/usr/bin/env Rscript
+'squishimi-r - produce sashimi style plots
+
+Usage:
+    squishimi-r [options] <coverage-table> <junctions-table> <output-file>
+
+Options:
+    --transcripts FILE      file-name for transcript annotation.
+' -> doc
+
+library(docopt)
+library(data.table)
+library(ggplot2)
+library(ggforce)
+knitr::opts_chunk$set(echo = TRUE)
+cbp1 <- c("#999999", "#E69F00", "#56B4E9", "#009E73",
+          "#F0E442", "#0072B2", "#D55E00", "#CC79A7")
+
+mkSplineTable <- function(cov, dat, maxCov, q80Cov) {
+    h <- maxCov
+    h10 <- h / 5.0
+    q80 <- q80Cov
+    df <- data.frame(x=c(), y=c(), grp=c());
+    dat[, txtHght := 0]
+    for (i in 1:length(dat$start)) {
+        lev <- dat[i, lev]
+        ctrlPtrHght <- ifelse(lev > 0, q80, 0) + h10 * lev
+        dat[i, txtHght := ctrlPtrHght]
+        df0 <- data.frame(x = c(dat[i, start], dat[i, start], dat[i, start], dat[i, stop], dat[i, stop], dat[i, stop]),
+                          y = c(0, 0.5*ctrlPtrHght, ctrlPtrHght, ctrlPtrHght, 0.5*ctrlPtrHght, 0),
+                          grp = c(i, i, i, i, i, i));
+        df <- rbind(df, df0);
+    }
+    return(df);
+}
+
+mk1Sashimi <- function(sampleName, cov, segs, minCov, maxCov, q80Cov, fillColour, keepAxis) {
+    curves <- mkSplineTable(cov, segs, maxCov, q80Cov)
+    tks <- seq(0, maxCov, 2*10^(ceiling(log10(maxCov))-1))
+    g <- ggplot(cov) +
+        geom_bar(data=cov, aes(pos, cov), stat='identity', fill=fillColour) +
+        geom_bspline2(data=curves, aes(x, y, group=grp)) +
+        geom_label(data=segs, aes(x=(start + stop)/2, y=txtHght, label = as.character(cov)), size=2, label.padding=unit(0.125, "lines")) +
+        scale_y_continuous(expand = c(.1, .1), breaks=tks, limits=c(minCov, maxCov)) +
+        labs(y=paste(sampleName, "coverage", sep="\n"))
+        theme_minimal()
+    if (!keepAxis) {
+        g <- g + theme(axis.title.x=element_blank(), axis.text.x=element_blank(), axis.ticks.x=element_blank())
+    }
+    return(g)
+}
+
+mkTxPlot <- function(txTbl) {
+    g <- ggplot(txTbl) +
+        geom_segment(data=txTbl[feature=="transcript"], aes(x=start, xend=end, y=transcript_id, yend=transcript_id, size=1)) +
+        geom_segment(data=txTbl[feature=="UTR"], aes(x=start, xend=end, y=transcript_id, yend=transcript_id, size=1.1)) +
+        geom_segment(data=txTbl[feature=="CDS"], aes(x=start, xend=end, y=transcript_id, yend=transcript_id, size=2)) +
+        labs(x=sprintf("position (%s)", txTbl[, unique(seqname)])) +
+        theme_minimal() +
+        theme(legend.title=element_blank(), axis.title.y=element_blank(), legend.position = "none")
+    return(g)
+}
+
+arguments <- docopt(doc, version = '0.1')
+#print(arguments)
+
+cov <- fread(arguments$coverage_table, header=T)
+junk <- fread(arguments$junctions_table, header=T)
+addTxs <- FALSE
+if (!is.null(arguments$transcripts)) {
+    txs <- fread("transcripts.txt", header=T)
+    addTxs <- TRUE
+}
+
+ggs <- list()
+sampleNames <- cov[, unique(sample)]
+
+# Work out if we need to keep the axis on any
+# of the coverage/junction sub-plots.
+#
+sampleForAxis = 0
+if (!addTxs) {
+    sampleForAxis = length(sampleNames)
+}
+
+# Get coverage/spline ranges to set the scales.
+#
+covRange <- cov[, range(cov)]
+q80Cov <- quantile(cov$cov, 0.80)
+splineRange <- range(mkSplineTable(cov, junk, covRange[2], q80Cov)$y)
+minCov <- min(splineRange[1], covRange[1])
+maxCov <- max(splineRange[2], covRange[2])
+
+# Generate the coverage/junction plots
+#
+for (i in 1:length(sampleNames)) {
+  sn <- sampleNames[i]
+  g1 <- mk1Sashimi(sn, cov[sample == sn], junk[sample == sn], minCov, maxCov, q80Cov, cbp1[i], i == sampleForAxis)
+  ggs[[sn]] <- g1
+}
+
+if (addTxs) {
+    ggs[["txs"]] <- mkTxPlot(txs)
+}
+pdf(arguments$output_file, width=8 , height=2*length(ggs), onefile=FALSE)
+egg::ggarrange(plots=ggs, ncol=1, align="h")
+dev.off()
+
+# vim: set ft=r:
