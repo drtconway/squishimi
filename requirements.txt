@@ -1,0 +1,4 @@
+docopt
+gtfparse
+intervaltree
+pysam

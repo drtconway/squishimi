@@ -1,0 +1,7 @@
+package	version	bioconductor
+-update-	NA	FALSE
+data.table	NA	FALSE
+docopt	NA	FALSE
+egg	NA	FALSE
+ggforce	NA	FALSE
+ggplot2	NA	FALSE
