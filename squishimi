@@ -205,7 +205,6 @@ class unionfind(object):
 
 class digraph(object):
     def __init__(self):
-        self.V = set([])
         self.fwd = {}
         self.rev = {}
 
@@ -222,101 +221,6 @@ class digraph(object):
             self.rev[y] = set([])
         self.rev[y].add(x)
 
-
-class tarjan(object):
-    def __init__(self, G):
-        self.G = G
-
-    def sccs(self):
-        self.idx = 0
-        self.I = {}
-        self.L = {}
-        self.S = []
-        self.O = set([])
-
-        V = set(self.G.fwd.keys()) | set(self.G.rev.keys())
-        for v in sorted(V):
-            if v not in self.I:
-                for r in self.scc(v):
-                    yield r
-
-    def scc(self, v):
-        self.I[v] = self.idx
-        self.L[v] = self.idx
-        self.idx += 1
-        self.S.append(v)
-        self.O.add(v)
-
-        for w in sorted(self.G[v]):
-            if w not in self.I:
-                for r in self.scc(w):
-                    yield r
-                self.L[v] = min(self.L[v], self.L[w])
-            elif w in self.O:
-                self.L[v] = min(self.L[v], self.I[w])
-
-        if self.L[v] == self.I[v]:
-            t = []
-            while True:
-                w = self.S.pop()
-                self.O.remove(w)
-                t.append(w)
-                if w == v:
-                    break
-            yield sorted(t)
-
-class undigraph(object):
-    def __init__(self):
-        self.edge = {}
-
-    def __getitem__(self, x):
-        if x in self.edge:
-            return self.edge[x]
-        return set([])
-
-    def __setitem__(self, x, y):
-        if x not in self.edge:
-            self.edge[x] = set([])
-        self.edge[x].add(y)
-        if y not in self.edge:
-            self.edge[y] = set([])
-        self.edge[y].add(x)
-
-def layout(itms):
-    over = IntervalTree()
-    under = IntervalTree()
-
-    perm = list(range(len(itms)))
-    random.shuffle(perm)
-    for i in perm:
-        (k, n) = itms[i]
-        oOlp = over.overlap(k[0], k[1])
-        oEnv = over.envelop(k[0], k[1])
-        oInt = oOlp - oEnv
-        uOlp = under.overlap(k[0], k[1])
-        uEnv = under.envelop(k[0], k[1])
-        uInt = uOlp - uEnv
-
-        if len(oOlp) == 0:
-            over[k[0]:k[1]] = n
-        elif len(uOlp) == 0:
-            under[k[0]:k[1]] = n
-        elif len(oInt) <= len(uInt):
-            over[k[0]:k[1]] = n
-        else:
-            under[k[0]:k[1]] = n
-
-    return (over, under)
-
-def score(ivls):
-    d = 0
-    for x in ivls:
-        o = ivls.overlap(x)
-        o.remove(x)
-        e = ivls.envelop(x)
-        e.remove(x)
-        d += len(o - e)
-    return d
 
 def parts(ivls):
     uf = unionfind()
@@ -342,30 +246,130 @@ def mkEnvGraph(xs, ivls):
         e = ivls.envelop(x[0], x[1])
         for yi in sorted(e):
             y = (yi[0], yi[1])
-            if y != x:
-                g[x] = y
+            if x == y:
+                continue
+            g[x] = y
     return g
 
 def mkIntGraph(xs, ivls):
-    g0 = mkEnvGraph(xs, ivls)
     g = digraph()
     for x in xs:
-        e = ivls.envelop(x[0], x[1])
-        for yi in sorted(e):
-            y = (yi[0], yi[1])
-            if y != x:
-                g[x] = y
         o = ivls.overlap(x[0], x[1])
+        e = ivls.envelop(x[0], x[1])
         for yi in sorted(o - e):
             y = (yi[0], yi[1])
-            if x in g0[y]:
+            if x == y:
                 continue
             g[x] = y
-            g[y] = x
     return g
 
+def mkRanks(xs, g):
+    r = {}
+    for x in xs:
+        r[x] = len(g[x])
+    return r
+
+def mkPartition(itms):
+    over = IntervalTree()
+    under = IntervalTree()
+
+    perm = list(range(len(itms)))
+    random.shuffle(perm)
+    ys = []
+    zs = []
+    for i in perm:
+        (k, n) = itms[i]
+        oN = len(over.overlap(k[0], k[1]))
+        uN = len(under.overlap(k[0], k[1]))
+        if oN < uN:
+            ys.append(k)
+            over[k[0]:k[1]] = n
+        elif uN < oN:
+            zs.append(k)
+            under[k[0]:k[1]] = n
+        elif random.random() < 0.5:
+            ys.append(k)
+            over[k[0]:k[1]] = n
+        else:
+            zs.append(k)
+            under[k[0]:k[1]] = n
+    return (ys, over, zs, under)
+
+def attemptLayout(itms):
+    n = len(itms)
+    bestScore = 100*((n+1)*(n+1))
+    bestOver = None
+    bestUnder = None
+    scores = []
+    for i in range(100):
+        (ys, over, zs, under) = mkPartition(itms)
+        oE = mkRanks(ys, mkEnvGraph(ys, over))
+        uE = mkRanks(ys, mkEnvGraph(zs, under))
+        oI = mkRanks(zs, mkIntGraph(ys, over))
+        uI = mkRanks(zs, mkIntGraph(zs, under))
+        nOE = max([0] + list(oE.values()))
+        nOI = max([0] + list(oI.values()))
+        nUE = max([0] + list(uE.values()))
+        nUI = max([0] + list(uI.values()))
+        d = len(ys) - len(zs)
+        d2 = d*d
+        score = sum([x*x for x in [nOE, 2*nOI, nUE, 2*nUI, d2]])
+        scores.append(score)
+        if score < bestScore:
+            bestScore = score
+            bestOver = (ys, over)
+            bestUnder = (zs, under)
+    return (bestOver, bestUnder)
+
+def assignRanks(xs, ivls):
+    e = mkEnvGraph(xs, ivls)
+    o = mkIntGraph(xs, ivls)
+    eRnk = mkRanks(xs, e)
+    oRnk = mkRanks(xs, o)
+
+    # First order by containment rank
+    #
+    R = {}
+    for x in xs:
+        r0 = len(e[x])
+        if r0 not in R:
+            R[r0] = set([])
+        R[r0].add(x)
+
+    # Now do a greedy graph-colouring within ranks.
+    #
+    S = {}
+    T = {}
+    for r in R.keys():
+        T[r] = 0
+        s = R[r]
+        S0 = {}
+        c = 1
+        for x in s:
+            for y in sorted(o[x] & s):
+                if y in S0:
+                    c = max(c, S0[y]) + 1
+            S0[x] = c
+            S[x] = (r, c)
+            T[r] = max(T[r], c)
+
+    # Work out a cumulative sum for each rank
+    #
+    Tcum = {}
+    t = 0
+    for r in sorted(T.keys()):
+        Tcum[r] = t
+        t += T[r]
+
+    # Now re-number everything
+    #
+    V = {}
+    for i, w in enumerate(sorted([(v, k) for (k,v) in S.items()])):
+        (r, c) = w[0]
+        V[w[1]] = Tcum[r] + c
+    return V
+
 def main(args):
-    #print(args)
     lazyAnnot = annotation(args['--annotation'])
     loc = locus(args['<locus>'], lazyAnnot)
     inputs = marshal_bams(args['<input>'], args['--sample-names'])
@@ -395,15 +399,26 @@ def main(args):
                 ivls[k[0]:k[1]] = n
 
             for xs in parts(ivls):
-                gph = mkIntGraph(xs, ivls)
-                t = tarjan(gph)
-                cs = list(t.sccs())
-                i = 0
-                for c in cs:
-                    for k in c:
-                        j = [1, -1][i &1]*(1 + (i >> 1))
-                        i += 1
-                        print(f"{sn}\t{k[0]+1}\t{k[1]}\t{junk[k]}\t{j}", file=out)
+                (o, u) = attemptLayout([(x, junk[x]) for x in xs])
+
+                (oXs, over) = o
+                oCovSum = sum([junk[x] for x in oXs])
+                (uXs, under) = u
+                uCovSum = sum([junk[x] for x in uXs])
+
+                # Flip the arcs by coverage
+                if oCovSum >= uCovSum:
+                    sgn = 1
+                else:
+                    sgn = -1
+
+                rnks = assignRanks(oXs, over)
+                for k in oXs:
+                    print(f"{sn}\t{k[0]+1}\t{k[1]}\t{junk[k]}\t{sgn*rnks[k]}", file=out)
+
+                rnks = assignRanks(uXs, under)
+                for k in uXs:
+                    print(f"{sn}\t{k[0]+1}\t{k[1]}\t{junk[k]}\t{-sgn*rnks[k]}", file=out)
 
     if args['--annotation']:
         annot = lazyAnnot()

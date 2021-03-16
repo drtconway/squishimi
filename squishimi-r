@@ -19,29 +19,30 @@ mkSplineTable <- function(cov, dat, maxCov, q80Cov) {
     h <- maxCov
     h10 <- h / 5.0
     q80 <- q80Cov
-    df <- data.frame(x=c(), y=c(), grp=c());
+    df <- data.frame(sample=c(), x=c(), y=c(), grp=c());
     dat[, txtHght := 0]
     for (i in 1:length(dat$start)) {
+        sn <- dat[i, sample]
         lev <- dat[i, lev]
         ctrlPtrHght <- ifelse(lev > 0, q80, 0) + h10 * lev
         dat[i, txtHght := ctrlPtrHght]
-        df0 <- data.frame(x = c(dat[i, start], dat[i, start], dat[i, start], dat[i, stop], dat[i, stop], dat[i, stop]),
+        df0 <- data.table(sample = rep(sn, 6),
+                          x = c(dat[i, start], dat[i, start], dat[i, start], dat[i, stop], dat[i, stop], dat[i, stop]),
                           y = c(0, 0.5*ctrlPtrHght, ctrlPtrHght, ctrlPtrHght, 0.5*ctrlPtrHght, 0),
-                          grp = c(i, i, i, i, i, i));
+                          grp = rep(i, 6));
         df <- rbind(df, df0);
     }
     return(df);
 }
 
-mk1Sashimi <- function(sampleName, cov, segs, minCov, maxCov, q80Cov, fillColour, keepAxis) {
-    curves <- mkSplineTable(cov, segs, maxCov, q80Cov)
-    tks <- seq(0, maxCov, 2*10^(ceiling(log10(maxCov))-1))
+mk1Sashimi <- function(sampleName, cov, segs, curves, minCov, maxCov, q80Cov, fillColour, keepAxis) {
+    tks <- labeling::extended(0, maxCov, m=4)
     g <- ggplot(cov) +
         geom_bar(data=cov, aes(pos, cov), stat='identity', fill=fillColour) +
         geom_bspline2(data=curves, aes(x, y, group=grp)) +
         geom_label(data=segs, aes(x=(start + stop)/2, y=txtHght, label = as.character(cov)), size=2, label.padding=unit(0.125, "lines")) +
         scale_y_continuous(expand = c(.1, .1), breaks=tks, limits=c(minCov, maxCov)) +
-        labs(y=paste(sampleName, "coverage", sep="\n"))
+        labs(y=paste(sampleName, "coverage", sep="\n")) +
         theme_minimal()
     if (!keepAxis) {
         g <- g + theme(axis.title.x=element_blank(), axis.text.x=element_blank(), axis.ticks.x=element_blank())
@@ -67,7 +68,7 @@ cov <- fread(arguments$coverage_table, header=T)
 junk <- fread(arguments$junctions_table, header=T)
 addTxs <- FALSE
 if (!is.null(arguments$transcripts)) {
-    txs <- fread("transcripts.txt", header=T)
+    txs <- fread(arguments$transcripts, header=T)
     addTxs <- TRUE
 }
 
@@ -86,7 +87,8 @@ if (!addTxs) {
 #
 covRange <- cov[, range(cov)]
 q80Cov <- quantile(cov$cov, 0.80)
-splineRange <- range(mkSplineTable(cov, junk, covRange[2], q80Cov)$y)
+curves <- mkSplineTable(cov, junk, covRange[2], q80Cov)
+splineRange <- range(curves$y)
 minCov <- min(splineRange[1], covRange[1])
 maxCov <- max(splineRange[2], covRange[2])
 
@@ -94,7 +96,7 @@ maxCov <- max(splineRange[2], covRange[2])
 #
 for (i in 1:length(sampleNames)) {
   sn <- sampleNames[i]
-  g1 <- mk1Sashimi(sn, cov[sample == sn], junk[sample == sn], minCov, maxCov, q80Cov, cbp1[i], i == sampleForAxis)
+  g1 <- mk1Sashimi(sn, cov[sample == sn], junk[sample == sn], curves[sample == sn], minCov, maxCov, q80Cov, cbp1[i], i == sampleForAxis)
   ggs[[sn]] <- g1
 }
 
